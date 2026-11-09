@@ -57,6 +57,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        MainActivity.isBotActive = false
         removeOverlay()
         stopAccessibilityScanning()
         Log.d(TAG, "Overlay Service destroyed")

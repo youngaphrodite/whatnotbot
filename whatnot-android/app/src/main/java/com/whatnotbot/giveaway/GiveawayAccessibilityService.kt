@@ -1,307 +1,195 @@
 package com.whatnotbot.giveaway
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.GestureDescription
 import android.content.Context
-import android.graphics.Path
-import android.graphics.Rect
-import android.os.Build
+import android.content.Intent
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 class GiveawayAccessibilityService : AccessibilityService() {
-
     companion object {
         private const val TAG = "GiveawayBot"
-        private const val WHATNOT_PACKAGE = "com.whatnot.whatnot"
+        private const val WHATNOT_PACKAGE = "com.whatnot_mobile"
+        private const val SCAN_INTERVAL_MS = 1000L
+        private const val ACTION_TIMEOUT_MS = 10000L
+        private const val COOLDOWN_MS = 3000L
 
-        // Timing constants
-        private const val SCAN_INTERVAL_MS = 1000L  // Check every second
-        private const val TAP_DELAY_MS = 500L       // Delay between taps
-        private const val COOLDOWN_MS = 3000L       // Cooldown after entering
-
-        // Singleton instance for overlay to communicate
         var instance: GiveawayAccessibilityService? = null
             private set
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private var isScanning = false
-    private var lastActionTime = 0L
+    private var connected = false
+    private var stateSince = 0L
+    private var awaitingConfirmation = false
     private var currentState = BotState.IDLE
 
-    enum class BotState {
-        IDLE,           // Not doing anything
-        WATCHING,       // Watching for giveaway button
-        ENTERING,       // In process of entering
-        ENTERED,        // Successfully entered, waiting
-        COOLDOWN        // Just entered, waiting before next action
-    }
+    enum class BotState { IDLE, WATCHING, ENTERING, ENTERED, COOLDOWN }
 
+    // One polling chain: frequent content events must not postpone scans indefinitely.
     private val scanRunnable = object : Runnable {
         override fun run() {
-            if (MainActivity.isBotActive && isWhatnotApp()) {
-                scanForGiveaway()
-            }
-            if (isScanning) {
-                handler.postDelayed(this, SCAN_INTERVAL_MS)
-            }
+            if (!isScanning) return
+            if (MainActivity.isBotActive) scanForGiveaway() else resetState()
+            if (isScanning) handler.postDelayed(this, SCAN_INTERVAL_MS)
         }
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        instance = this
-        Log.d(TAG, "Accessibility Service created")
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        instance = null
-        stopScanning()
-        Log.d(TAG, "Accessibility Service destroyed")
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.d(TAG, "Accessibility Service connected")
-        startScanning()
+        connected = true
+        instance = this
+        MainActivity.giveawaysEntered = getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(MainActivity.KEY_GIVEAWAY_COUNT, 0)
+        if (MainActivity.isBotActive) startScanning()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // We handle scanning in our runnable, but we can also respond to events
-        if (event == null) return
-
-        // Only process if bot is active and we're in Whatnot
-        if (!MainActivity.isBotActive) return
-        if (event.packageName != WHATNOT_PACKAGE) return
-
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                // Screen changed, might want to scan
-                if (currentState == BotState.WATCHING) {
-                    handler.removeCallbacks(scanRunnable)
-                    handler.postDelayed(scanRunnable, 200)
-                }
-            }
-        }
+        if (event?.packageName?.toString() != WHATNOT_PACKAGE || !MainActivity.isBotActive) return
+        // Also recover after an interruption; leave the existing poll deadline alone.
+        if (!isScanning) startScanning()
     }
 
-    override fun onInterrupt() {
-        Log.d(TAG, "Accessibility Service interrupted")
+    override fun onInterrupt() = stopScanning()
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        disconnect()
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        disconnect()
+        super.onDestroy()
+    }
+
+    private fun disconnect() {
+        connected = false
+        stopScanning()
+        if (instance === this) instance = null
     }
 
     fun startScanning() {
-        if (!isScanning) {
-            isScanning = true
-            currentState = BotState.WATCHING
-            handler.post(scanRunnable)
-            Log.d(TAG, "Started scanning for giveaways")
-        }
+        if (!connected || !MainActivity.isBotActive || isScanning) return
+        isScanning = true
+        resetState()
+        handler.post(scanRunnable)
     }
 
     fun stopScanning() {
         isScanning = false
-        currentState = BotState.IDLE
         handler.removeCallbacks(scanRunnable)
-        Log.d(TAG, "Stopped scanning")
+        resetState()
     }
 
-    private fun isWhatnotApp(): Boolean {
-        val rootNode = rootInActiveWindow ?: return false
-        return rootNode.packageName == WHATNOT_PACKAGE
+    private fun resetState() {
+        awaitingConfirmation = false
+        transition(if (isScanning && MainActivity.isBotActive) BotState.WATCHING else BotState.IDLE)
+    }
+
+    private fun transition(state: BotState) {
+        currentState = state
+        stateSince = SystemClock.elapsedRealtime()
     }
 
     private fun scanForGiveaway() {
-        if (!MainActivity.isBotActive) return
-
-        val rootNode = rootInActiveWindow ?: return
-
+        val root = rootInActiveWindow ?: return
         try {
+            // Check the same snapshot we act on; never inspect or click another app's tree.
+            if (root.packageName?.toString() != WHATNOT_PACKAGE) {
+                resetState()
+                return
+            }
+            val entered = hasLabel(root, GiveawayLabels::isEntered)
+            val elapsed = SystemClock.elapsedRealtime() - stateSince
+            if (entered) {
+                if (awaitingConfirmation) incrementGiveawayCount()
+                awaitingConfirmation = false
+                transition(BotState.ENTERED)
+                return
+            }
             when (currentState) {
-                BotState.WATCHING, BotState.IDLE -> {
-                    // Look for giveaway indicators
-                    if (findAndTapGiveawayButton(rootNode)) {
-                        currentState = BotState.ENTERING
-                    } else if (findEnterGiveawayButton(rootNode)) {
-                        // Card is already expanded, tap enter
-                        currentState = BotState.ENTERING
-                    } else if (isAlreadyEntered(rootNode)) {
-                        currentState = BotState.ENTERED
-                        Log.d(TAG, "Already in giveaway, watching for next one")
-                    }
-                }
+                BotState.ENTERED -> transition(BotState.WATCHING)
+                BotState.COOLDOWN -> if (elapsed >= COOLDOWN_MS) resetState()
                 BotState.ENTERING -> {
-                    // Tap the enter button
-                    if (tapEnterButton(rootNode)) {
-                        currentState = BotState.COOLDOWN
-                        incrementGiveawayCount()
-                        handler.postDelayed({
-                            currentState = BotState.WATCHING
-                        }, COOLDOWN_MS)
+                    if (elapsed >= ACTION_TIMEOUT_MS) {
+                        awaitingConfirmation = false
+                        transition(BotState.COOLDOWN)
+                    } else if (!awaitingConfirmation && clickLabel(root, GiveawayLabels::isEntry)) {
+                        awaitingConfirmation = true
+                        transition(BotState.ENTERING)
                     }
                 }
-                BotState.ENTERED -> {
-                    // Check if giveaway ended or new one started
-                    if (!isAlreadyEntered(rootNode)) {
-                        currentState = BotState.WATCHING
+                BotState.IDLE, BotState.WATCHING -> {
+                    // An expanded card takes priority over its giveaway heading/badge.
+                    if (clickLabel(root, GiveawayLabels::isEntry)) {
+                        awaitingConfirmation = true
+                        transition(BotState.ENTERING)
+                    } else if (!hasLabel(root, GiveawayLabels::isEntry) &&
+                        clickLabel(root, GiveawayLabels::isBadge)) {
+                        transition(BotState.ENTERING)
                     }
-                }
-                BotState.COOLDOWN -> {
-                    // Wait for cooldown
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error scanning: ${e.message}")
+            // Do not log screen text or exception messages that could contain it.
+            Log.w(TAG, "Accessibility scan failed: ${e.javaClass.simpleName}")
+            resetState()
         } finally {
-            rootNode.recycle()
+            root.recycle()
         }
     }
 
-    private fun findAndTapGiveawayButton(rootNode: AccessibilityNodeInfo): Boolean {
-        // Look for the "Giveaway" badge with entries count (top right area)
-        // It typically shows "Giveaway" and "X Entries"
+    private fun matches(node: AccessibilityNodeInfo, predicate: (String) -> Boolean): Boolean =
+        node.isVisibleToUser && (predicate(node.text?.toString().orEmpty()) ||
+            predicate(node.contentDescription?.toString().orEmpty()))
 
-        val giveawayNodes = mutableListOf<AccessibilityNodeInfo>()
-
-        // Search for text containing "Giveaway"
-        findNodesByText(rootNode, "Giveaway", giveawayNodes)
-        findNodesByText(rootNode, "giveaway", giveawayNodes)
-
-        for (node in giveawayNodes) {
-            // Check if this is the badge (not the expanded card)
-            val bounds = Rect()
-            node.getBoundsInScreen(bounds)
-
-            // Badge is typically in top right area (x > half screen width, y < 300)
-            val screenWidth = resources.displayMetrics.widthPixels
-            if (bounds.left > screenWidth / 2 && bounds.top < 400) {
-                // This looks like the giveaway badge, tap it
-                Log.d(TAG, "Found giveaway badge at: $bounds")
-
-                if (performTap(bounds.centerX(), bounds.centerY())) {
-                    Log.d(TAG, "Tapped giveaway badge")
-                    return true
-                }
-            }
-        }
-
-        return false
-    }
-
-    private fun findEnterGiveawayButton(rootNode: AccessibilityNodeInfo): Boolean {
-        // Look for "Enter Giveaway" button text
-        val enterNodes = mutableListOf<AccessibilityNodeInfo>()
-        findNodesByText(rootNode, "Enter Giveaway", enterNodes)
-        findNodesByText(rootNode, "Follow and Enter", enterNodes)
-
-        return enterNodes.isNotEmpty()
-    }
-
-    private fun tapEnterButton(rootNode: AccessibilityNodeInfo): Boolean {
-        // Find and tap "Enter Giveaway" or "Follow and Enter" button
-        val buttonTexts = listOf("Enter Giveaway", "Follow and Enter", "Enter")
-
-        for (buttonText in buttonTexts) {
-            val nodes = mutableListOf<AccessibilityNodeInfo>()
-            findNodesByText(rootNode, buttonText, nodes)
-
-            for (node in nodes) {
-                if (node.isClickable || node.isEnabled) {
-                    val bounds = Rect()
-                    node.getBoundsInScreen(bounds)
-
-                    // Make sure it's in a reasonable position (top area where card appears)
-                    if (bounds.top < 600) {
-                        Log.d(TAG, "Found enter button: $buttonText at $bounds")
-
-                        if (performTap(bounds.centerX(), bounds.centerY())) {
-                            Log.d(TAG, "Tapped enter button!")
-                            return true
-                        }
-                    }
-                }
-            }
-        }
-
-        return false
-    }
-
-    private fun isAlreadyEntered(rootNode: AccessibilityNodeInfo): Boolean {
-        // Look for "You're in the Giveaway" text
-        val enteredNodes = mutableListOf<AccessibilityNodeInfo>()
-        findNodesByText(rootNode, "You're in the Giveaway", enteredNodes)
-        findNodesByText(rootNode, "You're in", enteredNodes)
-
-        return enteredNodes.isNotEmpty()
-    }
-
-    private fun findNodesByText(
-        node: AccessibilityNodeInfo,
-        text: String,
-        results: MutableList<AccessibilityNodeInfo>
-    ) {
-        // Check current node
-        val nodeText = node.text?.toString() ?: ""
-        val contentDesc = node.contentDescription?.toString() ?: ""
-
-        if (nodeText.contains(text, ignoreCase = true) ||
-            contentDesc.contains(text, ignoreCase = true)) {
-            results.add(node)
-        }
-
-        // Check children
+    private fun hasLabel(node: AccessibilityNodeInfo, predicate: (String) -> Boolean): Boolean {
+        if (matches(node, predicate)) return true
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            findNodesByText(child, text, results)
+            try {
+                if (hasLabel(child, predicate)) return true
+            } finally {
+                child.recycle()
+            }
         }
+        return false
     }
 
-    private fun performTap(x: Int, y: Int): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-            return false
-        }
-
-        val now = System.currentTimeMillis()
-        if (now - lastActionTime < TAP_DELAY_MS) {
-            return false // Too soon after last tap
-        }
-
-        val path = Path()
-        path.moveTo(x.toFloat(), y.toFloat())
-
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 100))
-            .build()
-
-        val result = dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(gestureDescription: GestureDescription?) {
-                Log.d(TAG, "Tap completed at ($x, $y)")
+    private fun clickLabel(node: AccessibilityNodeInfo, predicate: (String) -> Boolean): Boolean {
+        if (matches(node, predicate) && clickTarget(node)) return true
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            try {
+                if (clickLabel(child, predicate)) return true
+            } finally {
+                child.recycle()
             }
-
-            override fun onCancelled(gestureDescription: GestureDescription?) {
-                Log.d(TAG, "Tap cancelled")
-            }
-        }, null)
-
-        if (result) {
-            lastActionTime = now
         }
+        return false
+    }
 
-        return result
+    private fun clickTarget(node: AccessibilityNodeInfo): Boolean {
+        if (!node.isVisibleToUser || !node.isEnabled) return false
+        if (node.isClickable) return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        val parent = node.parent ?: return false
+        try {
+            if (parent.packageName?.toString() != WHATNOT_PACKAGE) return false
+            return clickTarget(parent)
+        } finally {
+            parent.recycle()
+        }
     }
 
     private fun incrementGiveawayCount() {
         MainActivity.giveawaysEntered++
-        val prefs = getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putInt(MainActivity.KEY_GIVEAWAY_COUNT, MainActivity.giveawaysEntered).apply()
-        Log.d(TAG, "Giveaway entered! Total: ${MainActivity.giveawaysEntered}")
-
-        // Notify overlay to update
+        getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putInt(MainActivity.KEY_GIVEAWAY_COUNT, MainActivity.giveawaysEntered).apply()
         OverlayService.instance?.updateStatus("Entered! Total: ${MainActivity.giveawaysEntered}")
     }
 
