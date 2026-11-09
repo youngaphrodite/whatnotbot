@@ -11,6 +11,13 @@ class GiveawayLabelsTest {
         assertTrue(GiveawayLabels.isBadge("GIVEAWAY"))
     }
 
+    @Test fun recognizesFollowHostEntryFromPhoneScreenshot() {
+        assertTrue(GiveawayLabels.isEntry("Follow Host & Enter Giveaway"))
+        assertTrue(GiveawayLabels.isEntry(" FOLLOW HOST &\nENTER GIVEAWAY "))
+        assertFalse(GiveawayLabels.isEntry("Follow Host"))
+        assertFalse(GiveawayLabels.isEntry("Follow Host & Enter Giveaway rules"))
+    }
+
     @Test fun rejectsUnrelatedAndAmbiguousText() {
         for (label in listOf("Enter", "Enter shipping address", "Do not enter giveaway", "Entered")) {
             assertFalse(label, GiveawayLabels.isEntry(label))

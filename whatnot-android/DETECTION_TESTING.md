@@ -3,8 +3,8 @@
 The service is restricted to `com.whatnot_mobile` in both its configuration and
 its active-window check. It matches visible text or content descriptions after
 case, whitespace and apostrophe normalization. Supported labels are those already
-present in the original implementation: `Giveaway`, `Enter Giveaway`, `Follow and
-Enter`, and `You're in the Giveaway`. Generic `Enter` and `You're in` are excluded
+present in the original implementation plus the verified phone screenshot: `Giveaway`, `Enter Giveaway`, `Follow and
+Enter`, `Follow Host & Enter Giveaway`, and `You're in the Giveaway`. Generic `Enter` and `You're in` are excluded
 because they can describe unrelated actions. No coordinates or current Whatnot
 resource IDs are assumed.
 
@@ -53,3 +53,8 @@ The Android manifest has no Internet permission; the service does not store or
 transmit screen text. Statistics remain in private preferences. Android backup
 is still enabled as before, so the count may be backed up by the OS. Both services
 are non-exported and accessibility binding requires the system permission.
+
+Phone-reported follow-host fix: recognize the exact `Follow Host & Enter Giveaway`
+label. When an entry label is visible but cannot be clicked, do not fall back to
+a giveaway heading that could open item details. Test both followed and unfollowed
+hosts; follow-and-enter intentionally follows the host as the button states.

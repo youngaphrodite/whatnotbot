@@ -129,7 +129,8 @@ class GiveawayAccessibilityService : AccessibilityService() {
                     if (clickLabel(root, GiveawayLabels::isEntry)) {
                         awaitingConfirmation = true
                         transition(BotState.ENTERING)
-                    } else if (clickLabel(root, GiveawayLabels::isBadge)) {
+                    } else if (!hasLabel(root, GiveawayLabels::isEntry) &&
+                        clickLabel(root, GiveawayLabels::isBadge)) {
                         transition(BotState.ENTERING)
                     }
                 }
